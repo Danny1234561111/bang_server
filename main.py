@@ -238,7 +238,9 @@ class PlayerAction(BaseModel):
     action: str  # "play_card", "pass", "shoot", "use_card"
     card_name: str = None
     target_player_id: Optional[int] = None
-
+@app.get("/")
+async def root():
+    return {"message": "Hello World"}
 @app.get("/room/{room_id}")
 def get_room_state(room_id: int):
     room = rooms.get(room_id)
@@ -628,7 +630,7 @@ def process_dynamite_trigger(room: GameRoom):
             card = draw_card(room)
             if not card:
                 continue
-            if card.suit == 'пики' and 2 <= card.value <= 9:
+            if card.suit == 'пики' and 2 <= card.value and card.value <= 9:
                 # Взрыв! Игрок теряет 3 хп и динамит снимается.
                 p.hp -= 3
                 remove_permanent_effect(p, 'Динамит')
