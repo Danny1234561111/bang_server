@@ -800,4 +800,390 @@ def handle_play_card(room: GameRoom, player: Player, card_name: str, target_play
         return {"status": "Красотка применена"}
 
     reset_hand_size(player)
-    return {"status": f"Карта '{card_name}' сыгра
+    return {"status": f"Карта '{card_name}' сыграна"}
+def draw_card(room: GameRoom) -> Card:
+    """Draw a card from the deck using database operations."""
+    deck = db_get_deck(room.id)
+    if deck:
+        card = deck.pop(0)
+        db_remove_card_from_deck(room.id, card.name)
+        # Update the deck positions in the database after removing a card.
+        for i, remaining_card in enumerate(deck):
+            db_add_card_to_deck(room.id, remaining_card.name, i) # update positions, in fact
+        return card
+    else:
+        reshuffle_discard_pile(room)
+        deck = db_get_deck(room.id)
+        if deck:
+            card = deck.pop(0)
+            db_remove_card_from_deck(room.id, card.name)
+            return card
+        else:
+            return None  # No card at all!
+
+def process_dynamite_trigger(room: GameRoom):
+    for p in list(room.players.values()):
+        if has_permanent_effect(p, 'Динамит'):
+            card = draw_card(room) #Using db method to draw card
+            if not card:
+                continue
+            if card.suit == 'пики' and 2 <= card.value and card.value <= 9:
+                # Взрыв! Игрок теряет 3 хп и динамит снимается.
+                p.hp -= 3
+                remove_permanent_effect(p, 'Динамит')
+                db_update_player(p) #Update player on DB
+                db_add_card_to_discard_pile(room.id, card.name) #Discard to discard pool
+                check_player_death(p, room)
+            else:
+                add_permanent_effect(p, 'Динамит')
+                db_update_player(p)
+                db_add_card_to_discard_pile(room.id, card.name)
+
+def get_next_player(room: GameRoom, current_player_id: int) -> Optional[Player]:
+  """Get next player in a circle"""
+  players = {p_id: db_get_player(p_id) for p_id in room.players}
+  current_idx = next((i for i, p in enumerate(players.values()) if p.id == current_player_id), 0)
+  total = len(players)
+  for i in range(1, total + 1):
+    next_idx = (current_idx + i) % total
+    next_player = list(players.values())[next_idx] #Changed to work with dict
+    if next_player.is_alive:
+      return next_player
+
+  return None #no next player
+
+def reset_hand_size(player : Player):
+   while len(player.hand) > player.hp:
+        card = player.hand.pop() #reset the size
+        db_remove_card_from_player_hand(player.id, card.name) #remove on DB
+        #Discard ?
+
+def check_player_death(player: Player, room: GameRoom):
+    if player.hp <= 0:
+        player.is_alive = False
+        db_update_player(player) #Also update
+
+def pass_turn(room: GameRoom):
+    """Advances the game turn to the next player."""
+    advance_turn(room)
+
+def advance_turn(room: GameRoom):
+   players = {p_id: db_get_player(p_id) for p_id in room.players}
+   current_idx = next((i for i, p in enumerate(players.values()) if p.id == room.current_player_id), 0)
+   total = len(players)
+
+   for i in range(1, total + 1):
+        next_idx = (current_idx + i) % total
+        next_player = list(players.values())[next_idx] # List because it is needed
+        if next_player.is_alive:
+            room.current_player_id = next_player.id
+            db_update_room(room) #Update to new player
+            break
+
+def check_turma(player: Player, room: GameRoom) -> bool:
+    card = draw_card(room)
+    if card and card.suit == "черви":
+        remove_permanent_effect(player, "Тюрьма")
+        db_update_player(player)
+        db_add_card_to_discard_pile(room.id, card.name)
+        return True  # Освобожден
+    else:
+        if card:
+            db_add_card_to_discard_pile(room.id, card.name)
+        return False
+
+def handle_krassotka(player: Player, room: GameRoom):
+  """Handles Krassotka effect action, take a random card"""
+  room = db_get_room(room.id) #need to reload
+
+  if not room.current_player_id:
+        raise HTTPException(status_code=500, detail="Текущий игрок не определен")
+
+  players = {p_id: db_get_player(p_id) for p_id in room.players}
+
+  for p2Id, p2 in players.items():
+    if p2Id != room.current_player_id and p2.hand:
+           #Remove a random card from target
+           card_to_steal_index = random.randint(0, len(p2.hand) - 1)
+           card_to_steal = p2.hand[card_to_steal_index]
+           p2.hand.remove(card_to_steal)
+           db_remove_card_from_player_hand(p2.id, card_to_steal.name)
+
+           #Add card
+           player.hand.append(card_to_steal)
+           db_add_card_to_player_hand(player.id, card_to_steal.name)
+           db_update_player(player)
+           db_update_player(p2)
+           db_add_card_to_discard_pile(room.id, card_to_steal.name) #remove from discard pile
+
+def handle_panic(player: Player, room: GameRoom):
+  """Handles Panika effect action, take a random card"""
+  if not room.current_player_id:
+        raise HTTPException(status_code=500, detail="Текущий игрок не определен")
+
+  players = {p_id: db_get_player(p_id) for p_id in room.players}
+
+  for p2Id, p2 in players.items():
+    if p2Id != room.current_player_id and p2.hand:
+           #Remove a random card from target
+           card_to_steal_index = random.randint(0, len(p2.hand) - 1)
+           card_to_steal = p2.hand[card_to_steal_index]
+           p2.hand.remove(card_to_steal)
+           db_remove_card_from_player_hand(p2.id, card_to_steal.name)
+
+           #Add card
+           player.hand.append(card_to_steal)
+           db_add_card_to_player_hand(player.id, card_to_steal.name)
+           db_update_player(player)
+           db_update_player(p2)
+
+def handle_pivo(player: Player, room: GameRoom):
+    if player.hp < player.max_hp:
+        player.hp += 1
+        db_update_player(player) #Update Player
+
+def handle_magazin(player: Player, room: GameRoom):
+   for _ in range(len(room.players.values())):  # number of players
+        card = draw_card(room)
+
+        if card:
+            player.hand.append(card) #add to current player hand
+            db_add_card_to_player_hand(player.id, card.name)
+            db_update_player(player)
+        else:
+            reshuffle_discard_pile(room)
+            card = draw_card(room)
+            if card:
+                player.hand.append(card)
+                db_add_card_to_player_hand(player.id, card.name)
+                db_update_player(player)
+            else:
+                break #No more card possible to add
+
+def handle_gatling(room: GameRoom, p1: Player):
+    """Handles the Gatling card"""
+    # Fire at everyone who can be defended
+    players = {p_id: db_get_player(p_id) for p_id in room.players}
+
+    for p2Id, p2 in players.items():
+        # Avoid shooting yourself
+        if p2Id != p1.id:
+            handle_defend(room, p2, p1)
+
+def handle_turma(p1: Player, p2: Player):
+
+    add_permanent_effect(p2, 'Тюрьма')
+    db_update_player(p2) #Update player
+
+def draw_card(room: GameRoom) -> Card:
+    """Draw a card from the deck using database operations."""
+    deck = db_get_deck(room.id)
+    if deck:
+        card = deck.pop(0)
+        db_remove_card_from_deck(room.id, card.name)
+        # Update the deck positions in the database after removing a card.
+        deck_reload = db_get_deck(room.id)
+        for i, remaining_card in enumerate(deck_reload):
+            cursor.execute("UPDATE deck SET position = ? WHERE room_id = ? AND card_name = ?",
+                        (i, room.id, remaining_card.name))
+        conn.commit()
+        return card
+    else:
+        reshuffle_discard_pile(room)
+        deck = db_get_deck(room.id)
+        if deck:
+            card = deck.pop(0)
+            db_remove_card_from_deck(room.id, card.name)
+            deck_reload = db_get_deck(room.id)
+            for i, remaining_card in enumerate(deck_reload):
+                cursor.execute("UPDATE deck SET position = ? WHERE room_id = ? AND card_name = ?",
+                            (i, room.id, remaining_card.name))
+            conn.commit()
+            return card
+        else:
+            return None  # No card at all!
+
+def handle_dynamite(room: GameRoom):
+     for p in list(room.players.values()):
+        if has_permanent_effect(p, 'Динамит'):
+            return
+
+     #Apply dynamite
+     for p in list(room.players.values()):
+        add_permanent_effect(p, 'Динамит')
+        db_update_player(p)
+
+def handle_bocka(player: Player):
+  add_permanent_effect(player, 'Бочка')
+  db_update_player(player)
+
+def process_dynamite_trigger(room: GameRoom):
+    #Get fresh room for correct player's properties
+    room = db_get_room(room.id)
+    players = {p_id: db_get_player(p_id) for p_id in room.players} #Get all players
+
+    for p2Id, p2 in players.items():
+        if has_permanent_effect(p2, 'Динамит'):
+            card = draw_card(room) #Using db method to draw card
+            if not card:
+                continue
+
+            db_add_card_to_discard_pile(room.id, card.name) #Discard to discard pool
+
+            if card.suit == 'пики' and 2 <= card.value and card.value <= 9:
+                # Взрыв! Игрок теряет 3 хп и динамит снимается.
+                p2.hp -= 3
+                remove_permanent_effect(p2, 'Динамит')
+
+                db_update_player(p2) #Update player on DB
+                check_player_death(p2, room)
+
+            else:
+                remove_permanent_effect(p2, 'Динамит')
+
+                db_update_player(p2)
+
+                #Try to get next alive player
+                next_player = get_next_player(room, p2.id)
+                if next_player:
+                    add_permanent_effect(next_player, 'Динамит')
+                    db_update_player(next_player)
+
+def get_next_player(room: GameRoom, current_player_id: int) -> Optional[Player]:
+  """Get next player in a circle"""
+
+  players = {p_id: db_get_player(p_id) for p_id in room.players}
+
+  current_idx = next((i for i, p in enumerate(players.values()) if p.id == current_player_id), 0)
+  total = len(players)
+
+  for i in range(1, total + 1):
+    next_idx = (current_idx + i) % total
+    next_player = list(players.values())[next_idx] #Changed to work with dict
+    if next_player.is_alive:
+      return next_player
+
+  return None #no next player
+
+def reset_hand_size(player : Player):
+   while len(player.hand) > player.hp:
+        card = player.hand.pop() #reset the size
+        db_remove_card_from_player_hand(player.id, card.name) #remove on DB
+        #Discard ?
+
+def check_player_death(player: Player, room: GameRoom):
+    #Need to get fresh values from DB
+    player = db_get_player(player.id)
+
+    if player.hp <= 0:
+        player.is_alive = False
+        db_update_player(player) #Also update
+
+def pass_turn(room: GameRoom):
+    """Advances the game turn to the next player."""
+    room = db_get_room(room.id)
+    advance_turn(room)
+
+def advance_turn(room: GameRoom):
+   players = {p_id: db_get_player(p_id) for p_id in room.players}
+   current_idx = next((i for i, p in enumerate(players.values()) if p.id == room.current_player_id), 0)
+   total = len(players)
+
+   for i in range(1, total + 1):
+        next_idx = (current_idx + i) % total
+        next_player = list(players.values())[next_idx] # List because it is needed
+        if next_player.is_alive:
+            room.current_player_id = next_player.id
+            db_update_room(room) #Update to new player
+            break
+
+def check_turma(player: Player, room: GameRoom) -> bool:
+    card = draw_card(room)
+    if card and card.suit == "черви":
+        remove_permanent_effect(player, "Тюрьма")
+        db_update_player(player)
+        db_add_card_to_discard_pile(room.id, card.name)
+        return True  # Освобожден
+    else:
+        if card:
+            db_add_card_to_discard_pile(room.id, card.name)
+        return False
+
+def handle_krassotka(player: Player, room: GameRoom):
+  """Handles Krassotka effect action, take a random card"""
+  #Need to get fresh room for correct player's properties
+  room = db_get_room(room.id) #Need to reload
+
+  if not room.current_player_id:
+        raise HTTPException(status_code=500, detail="Текущий игрок не определен")
+
+  players = {p_id: db_get_player(p_id) for p_id in room.players}
+
+  for p2Id, p2 in players.items():
+    if p2Id != room.current_player_id and p2.hand:
+           #Remove a random card from target
+           card_to_steal_index = random.randint(0, len(p2.hand) - 1)
+           card_to_steal = p2.hand[card_to_steal_index]
+           p2.hand.remove(card_to_steal)
+           db_remove_card_from_player_hand(p2.id, card_to_steal.name)
+
+           #Add card
+           player.hand.append(card_to_steal)
+           db_add_card_to_player_hand(player.id, card_to_steal.name)
+           db_update_player(player)
+           db_update_player(p2)
+           db_add_card_to_discard_pile(room.id, card_to_steal.name) #remove from discard pile
+
+def handle_panic(player: Player, room: GameRoom):
+  """Handles Panika effect action, take a random card"""
+  room = db_get_room(room.id)
+
+  if not room.current_player_id:
+        raise HTTPException(status_code=500, detail="Текущий игрок не определен")
+
+  players = {p_id: db_get_player(p_id) for p_id in room.players}
+
+  for p2Id, p2 in players.items():
+    #Need to get fresh properties in order to draw cards
+    p2 = db_get_player(p2Id)
+    if p2Id != room.current_player_id and len(p2.hand) != 0:
+        print("Player Name with action is", p2.name)
+        #Remove a random card from target
+        card_to_steal_index = random.randint(0, len(p2.hand) - 1)
+        card_to_steal = p2.hand[card_to_steal_index]
+
+        if not card_to_steal:
+           return
+
+        db_remove_card_from_player_hand(p2Id, card_to_steal.name)
+
+        #Add card
+        card = db_get_card(card_to_steal.name)
+        player.hand.append(card)
+        db_add_card_to_player_hand(player.id, card.name)
+
+def handle_pivo(player: Player, room: GameRoom):
+    if player.hp < player.max_hp:
+        player.hp += 1
+        db_update_player(player) #Update Player
+
+def handle_magazin(player: Player, room: GameRoom):
+    players = {p_id: db_get_player(p_id) for p_id in room.players}
+
+    for p2Id, p2 in players.items():
+      if p2Id != player.id:
+        card = draw_card(room)
+
+        if card:
+            player.hand.append(card) #add to current player hand
+            db_add_card_to_player_hand(player.id, card.name) # and add to db player hand
+            db_update_player(player)
+        else:
+            reshuffle_discard_pile(room)
+            card = draw_card(room)
+            if card:
+                player.hand.append(card)
+                db_add_card_to_player_hand(player.id, card.name)
+                db_update_player(player)
+            else:
+                break #No more card possible to add
