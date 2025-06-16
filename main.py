@@ -2,44 +2,112 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 import random
+import sqlite3
 
 app = FastAPI()
 
-# Модели данных
+# Database setup
+DATABASE_URL = "game.db"  # SQLite database file
+conn = sqlite3.connect(DATABASE_URL, check_same_thread=False)
+cursor = conn.cursor()
 
+# Create tables (if they don't exist)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS cards (
+    name TEXT PRIMARY KEY,
+    suit TEXT,
+    value INTEGER
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS players (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    hp INTEGER DEFAULT 4,
+    max_hp INTEGER DEFAULT 5,
+    role TEXT,
+    is_alive INTEGER DEFAULT 1,  -- 1 for True, 0 for False
+    is_ready INTEGER DEFAULT 0,
+    position INTEGER DEFAULT 0,
+    weapon TEXT DEFAULT 'Кольт',
+    permanent_effects TEXT DEFAULT '[]'
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS game_rooms (
+    id INTEGER PRIMARY KEY,
+    game_started INTEGER DEFAULT 0,
+    current_player_id INTEGER,
+    roles_assigned INTEGER DEFAULT 0
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS player_hands (
+    player_id INTEGER,
+    card_name TEXT,
+    FOREIGN KEY (player_id) REFERENCES players(id),
+    FOREIGN KEY (card_name) REFERENCES cards(name),
+    PRIMARY KEY (player_id, card_name)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS deck (
+    room_id INTEGER,
+    card_name TEXT,
+    position INTEGER,  -- Order in the deck
+    FOREIGN KEY (room_id) REFERENCES game_rooms(id),
+    FOREIGN KEY (card_name) REFERENCES cards(name),
+    PRIMARY KEY (room_id, card_name)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS discard_pile (
+    room_id INTEGER,
+    card_name TEXT,
+    FOREIGN KEY (room_id) REFERENCES game_rooms(id),
+    FOREIGN KEY (card_name) REFERENCES cards(name),
+    PRIMARY KEY (room_id, card_name)
+)
+""")
+
+conn.commit()
+
+
+# Models (using Pydantic for API interaction, not directly for database)
 class Card(BaseModel):
     name: str
-    suit: Optional[str] = None  # Масть (черви, пики и т.д.)
-    value: Optional[int] = None  # Номинал (цифра)
+    suit: Optional[str] = None
+    value: Optional[int] = None
 
 
 class Player(BaseModel):
     id: int
     name: str
-    hp: int = 4
-    max_hp: int = 5
-    hand: List[Card] = []
-    role: Optional[str] = None  # 'шериф', 'бандит', 'ренегат', 'помощник'
-    is_alive: bool = True
-    is_ready: bool = False
-    position: int = 0  # для определения расстояний
-    weapon: str = "Кольт"  # Оружие (Кольт, Скофилд и т.д.)
-    permanent_effects: List[str] = []  # Постоянные эффекты (Мустанг, Прицел и т.п.)
+    hp: int
+    max_hp: int
+    hand: List[Card]  # Updated type hint
+    role: Optional[str] = None
+    is_alive: bool
+    is_ready: bool
+    position: int
+    weapon: str
+    permanent_effects: List[str]  # Storing as list
 
 
 class GameRoom(BaseModel):
     id: int
-    players: Dict[int, Player] = {}
-    deck: List[Card] = []
-    discard_pile: List[Card] = []
-    game_started: bool = False
-    current_player_id: Optional[int] = None
-    roles_assigned: bool = False
+    players: Dict[int, Player]  # Updated type hint
+    game_started: bool
+    current_player_id: Optional[int]
+    roles_assigned: bool
 
-rooms: Dict[int, GameRoom] = {}
 
-# Константы
-
+# Constants
 WEAPONS = {
     "Кольт": 1,
     "Скофилд": 2,
@@ -49,126 +117,270 @@ WEAPONS = {
     "Воканчик": 1,
 }
 
-# Создание колоды карт
+
+# Database Helper Functions
+def db_get_card(card_name: str) -> Optional[Card]:
+    cursor.execute("SELECT name, suit, value FROM cards WHERE name = ?", (card_name,))
+    row = cursor.fetchone()
+    if row:
+        name, suit, value = row
+        return Card(name=name, suit=suit, value=value)
+    return None
+
+
+def db_add_card(card: Card):
+    try:
+        cursor.execute("INSERT INTO cards (name, suit, value) VALUES (?, ?, ?)",
+                       (card.name, card.suit, card.value))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Card already exists, you can handle this as needed (e.g., update)
+        pass
+
+
+def db_get_player(player_id: int) -> Optional[Player]:
+    cursor.execute(
+        "SELECT id, name, hp, max_hp, role, is_alive, is_ready, position, weapon, permanent_effects FROM players WHERE id = ?",
+        (player_id,))
+    row = cursor.fetchone()
+    if row:
+        id, name, hp, max_hp, role, is_alive, is_ready, position, weapon, permanent_effects_str = row
+        # Fetch hand cards
+        cursor.execute("SELECT card_name FROM player_hands WHERE player_id = ?", (id,))
+        card_names = [row[0] for row in cursor.fetchall()]
+        hand = [db_get_card(card_name) for card_name in card_names if db_get_card(card_name) is not None]
+
+        # Parse permanent_effects
+        try:
+            permanent_effects = eval(permanent_effects_str)  # Be cautious when using eval
+            if not isinstance(permanent_effects, list):
+                permanent_effects = []
+        except:
+            permanent_effects = []
+
+        return Player(id=id, name=name, hp=hp, max_hp=max_hp, hand=hand, role=role,
+                      is_alive=bool(is_alive), is_ready=bool(is_ready), position=position, weapon=weapon,
+                      permanent_effects=permanent_effects)
+    return None
+
+
+def db_add_player(player: Player):
+    cursor.execute("""
+        INSERT INTO players (id, name, hp, max_hp, role, is_alive, is_ready, position, weapon, permanent_effects)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (player.id, player.name, player.hp, player.max_hp, player.role, int(player.is_alive), int(player.is_ready),
+          player.position, player.weapon, str(player.permanent_effects)))  # Store permanent_effects as string
+    conn.commit()
+
+
+def db_update_player(player: Player):
+    cursor.execute("""
+        UPDATE players SET name=?, hp=?, max_hp=?, role=?, is_alive=?, is_ready=?, position=?, weapon=?, permanent_effects=?
+        WHERE id=?
+    """, (
+    player.name, player.hp, player.max_hp, player.role, int(player.is_alive), int(player.is_ready), player.position,
+    player.weapon, str(player.permanent_effects), player.id))  # Store as string
+    conn.commit()
+
+
+def db_get_room(room_id: int) -> Optional[GameRoom]:
+    cursor.execute("SELECT id, game_started, current_player_id, roles_assigned FROM game_rooms WHERE id = ?",
+                   (room_id,))
+    row = cursor.fetchone()
+    if row:
+        id, game_started, current_player_id, roles_assigned = row
+        # Fetch players
+        cursor.execute(
+            "SELECT id FROM players WHERE id IN (SELECT player_id FROM player_hands WHERE player_id IN (SELECT id FROM players WHERE id IN (SELECT player_id FROM player_hands)))",
+            (id,))
+        player_ids = [row[0] for row in cursor.fetchall()]
+        players = {player_id: db_get_player(player_id) for player_id in player_ids if
+                   db_get_player(player_id) is not None}
+
+        return GameRoom(id=id, players=players, game_started=bool(game_started),
+                        current_player_id=current_player_id, roles_assigned=bool(roles_assigned))
+    return None
+
+
+def db_add_room(room_id: int):
+    cursor.execute("INSERT INTO game_rooms (id, game_started, current_player_id, roles_assigned) VALUES (?, ?, ?, ?)",
+                   (room_id, 0, None, 0))
+    conn.commit()
+
+
+def db_update_room(room: GameRoom):
+    cursor.execute("""
+        UPDATE game_rooms SET game_started=?, current_player_id=?, roles_assigned=?
+        WHERE id=?
+    """, (int(room.game_started), room.current_player_id, int(room.roles_assigned), room.id))
+    conn.commit()
+
+
+def db_add_card_to_player_hand(player_id: int, card_name: str):
+    cursor.execute("INSERT INTO player_hands (player_id, card_name) VALUES (?, ?)",
+                   (player_id, card_name))
+    conn.commit()
+
+
+def db_remove_card_from_player_hand(player_id: int, card_name: str):
+    cursor.execute("DELETE FROM player_hands WHERE player_id=? AND card_name=?",
+                   (player_id, card_name))
+    conn.commit()
+
+
+def db_get_deck(room_id: int) -> List[Card]:
+    cursor.execute("SELECT card_name FROM deck WHERE room_id = ? ORDER BY position", (room_id,))
+    card_names = [row[0] for row in cursor.fetchall()]
+    return [db_get_card(card_name) for card_name in card_names if db_get_card(card_name) is not None]
+
+
+def db_add_card_to_deck(room_id: int, card_name: str, position: int):
+    cursor.execute("INSERT INTO deck (room_id, card_name, position) VALUES (?, ?, ?)",
+                   (room_id, card_name, position))
+    conn.commit()
+
+
+def db_remove_card_from_deck(room_id: int, card_name: str):
+    cursor.execute("DELETE FROM deck WHERE room_id=? AND card_name=?", (room_id, card_name))
+    conn.commit()
+
+
+def db_clear_deck(room_id: int):
+    cursor.execute("DELETE FROM deck WHERE room_id=?", (room_id,))
+    conn.commit()
+
+
+def db_get_discard_pile(room_id: int) -> List[Card]:
+    cursor.execute("SELECT card_name FROM discard_pile WHERE room_id = ?", (room_id,))
+    card_names = [row[0] for row in cursor.fetchall()]
+    return [db_get_card(card_name) for card_name in card_names if db_get_card(card_name) is not None]
+
+
+def db_add_card_to_discard_pile(room_id: int, card_name: str):
+    cursor.execute("INSERT INTO discard_pile (room_id, card_name) VALUES (?, ?)",
+                   (room_id, card_name))
+    conn.commit()
+
+
+def db_clear_discard_pile(room_id: int):
+    cursor.execute("DELETE FROM discard_pile WHERE room_id=?", (room_id,))
+    conn.commit()
+
+
+# Data initialization moved to database
 def create_deck():
     suits = ["черви", "бубны", "трефы", "пики"]
-    values = list(range(2, 11))  # карты от 2 до 10
+    values = list(range(2, 11))
 
     deck = []
 
-    # Добавляем обычные карты (масть + значение)
     for suit in suits:
         for value in values:
-            deck.append(Card(name=f"{value}_{suit}", suit=suit, value=value))
-
-    # Бэнг (выстрел) - 25 карт
+            card = Card(name=f"{value}_{suit}", suit=suit, value=value)
+            db_add_card(card)  # Add to DB
+            deck.append(card.name)  # Append the card name
+    # Simplified code due the usage of DB
     for _ in range(25):
-        deck.append(Card(name="Бэнг"))
-
-    # Мимо (уворот) - 15 карт
+        db_add_card(Card(name="Бэнг"))
+        deck.append("Бэнг")
     for _ in range(15):
-        deck.append(Card(name="Мимо"))
-
-    # Пиво (восстановление здоровья) - 10 карт
+        db_add_card(Card(name="Мимо"))
+        deck.append("Мимо")
     for _ in range(10):
-        deck.append(Card(name="Пиво"))
-
-    # Дилижанс (взять две карты из колоды) - 2 карты
+        db_add_card(Card(name="Пиво"))
+        deck.append("Пиво")
     for _ in range(2):
-        deck.append(Card(name="Дилижанс"))
-
-    # Уэллс Фарго (взять три карты из колоды)
+        db_add_card(Card(name="Дилижанс"))
+        deck.append("Дилижанс")
     for _ in range(2):
-        deck.append(Card(name="Уэллс Фарго"))
-
-    # Магазин (карты для всех игроков) - 2 карты
+        db_add_card(Card(name="Уэллс Фарго"))
+        deck.append("Уэллс Фарго")
     for _ in range(2):
-        deck.append(Card(name="Магазин"))
-
-    # Паника (забрать карту другого игрока) - 3 карты
+        db_add_card(Card(name="Магазин"))
+        deck.append("Магазин")
     for _ in range(3):
-        deck.append(Card(name="Паника"))
-
-    # Красотка (сбросить карту другого игрока) - 3 карты
+        db_add_card(Card(name="Паника"))
+        deck.append("Паника")
     for _ in range(3):
-        deck.append(Card(name="Красотка"))
-
-    # Гатлинг (выстрел по всем) - 1 карта
+        db_add_card(Card(name="Красотка"))
+        deck.append("Красотка")
     for _ in range(1):
-        deck.append(Card(name="Гатлинг"))
-
-    # Дуэль (вызов на дуэль) - 3 карты
+        db_add_card(Card(name="Гатлинг"))
+        deck.append("Гатлинг")
     for _ in range(3):
-        deck.append(Card(name="Дуэль"))
+        db_add_card(Card(name="Дуэль"))
+        deck.append("Дуэль")
 
-    # Оружие (пока добавим только Скофилд для примера)
-    deck.append(Card(name="Скофилд")) #TODO исправить как константы
-
-    # Бочка
-    deck.append(Card(name="Бочка", suit="черви", value=None)) #TODO исправить
-
-    # Тюрьма
-    deck.append(Card(name="Тюрьма")) #TODO исправить
-
-    # Динамит
-    deck.append(Card(name="Динамит")) #TODO исправить
-
-    #Мустанг
-    deck.append(Card(name="Мустанг")) #TODO исправить
-
-    #Прицел
-    deck.append(Card(name="Прицел")) #TODO исправить
+    db_add_card(Card(name="Скофилд"))  # weapon
+    deck.append("Скофилд")
+    db_add_card(Card(name="Бочка", suit="черви", value=None))  # TODO
+    deck.append("Бочка")
+    db_add_card(Card(name="Тюрьма"))  # TODO
+    deck.append("Тюрьма")
+    db_add_card(Card(name="Динамит"))  # TODO
+    deck.append("Динамит")
+    db_add_card(Card(name="Мустанг"))  # TODO
+    deck.append("Мустанг")
+    db_add_card(Card(name="Прицел"))  # TODO
+    deck.append("Прицел")
 
     random.shuffle(deck)
     return deck
 
-# API endpoints
 
+# API endpoints
 @app.post("/create_room/{room_id}")
 def create_room(room_id: int):
-    if room_id in rooms:
+    if db_get_room(room_id):
         raise HTTPException(status_code=400, detail="Комната уже существует")
 
-    rooms[room_id] = GameRoom(id=room_id)
+    db_add_room(room_id)
     return {"message": f"Комната {room_id} создана"}
+
 
 @app.post("/add_player/{room_id}/{player_name}")
 def add_player(room_id: int, player_name: str):
-    room = rooms.get(room_id)
+    room = db_get_room(room_id)
     if not room:
         raise HTTPException(status_code=404, detail="Комната не найдена")
 
     new_id = len(room.players) + 1
     position = new_id - 1
 
-    player = Player(id=new_id, name=player_name, position=position)
-    room.players[new_id] = player
+    player = Player(id=new_id, name=player_name, hp=4, max_hp=5, hand=[], role=None, is_alive=True, is_ready=False,
+                    position=position, weapon="Кольт", permanent_effects=[])  # Removed hand assignment
+    db_add_player(player)
+
+    # Update the player within the room.  This is necessary to reflect the changes.
+    room = db_get_room(room_id)  # Re-fetch the room
+
     return {"message": f"Игрок {player_name} добавлен в комнату {room_id}"}
+
 
 @app.post("/ready/{room_id}/{player_id}")
 def set_ready(room_id: int, player_id: int):
-    room = rooms.get(room_id)
-    if not room:
-        raise HTTPException(status_code=404, detail="Комната не найдена")
-    player = room.players.get(player_id)
+    player = db_get_player(player_id)
     if not player:
         raise HTTPException(status_code=404, detail="Игрок не найден")
 
     player.is_ready = True
+    db_update_player(player)
     return {"message": f"Игрок {player_id} готов"}
+
 
 @app.post("/start_game/{room_id}")
 def start_game(room_id: int):
-    room = rooms.get(room_id)
+    room = db_get_room(room_id)
     if not room:
         raise HTTPException(status_code=404, detail="Комната не найдена")
+    players = {p_id: db_get_player(p_id) for p_id in room.players}
 
-    if len(room.players) < 4:
+    if len(players) < 4:
         raise HTTPException(status_code=400, detail="Недостаточно игроков для начала игры")
-    if any(not p.is_ready for p in room.players.values()):
+    if any(not p.is_ready for p in players.values()):
         raise HTTPException(status_code=400, detail="Не все игроки готовы")
 
-    num_players = len(room.players)
+    num_players = len(players)
 
     if num_players not in [4, 5, 6, 7]:
         raise HTTPException(
@@ -177,23 +389,35 @@ def start_game(room_id: int):
 
     roles = assign_roles(num_players)
 
-    for player, role in zip(room.players.values(), roles):
+    player_list = list(players.values())
+    for i, role in enumerate(roles):
+        player = player_list[i]
         player.role = role
+        db_update_player(player)
 
-    room.deck = create_deck()
+    deck = create_deck()
+    db_clear_deck(room_id)  # clear the deck
+    # Initialize the deck in the database
+    for i, card_name in enumerate(deck):
+        db_add_card_to_deck(room_id, card_name, i)
 
     # Раздача карт (по 4 карты каждому игроку)
-    for player in room.players.values():
-        player.hand = []
+    for player in players.values():
+        # Clear player hands
+        clear_player_hand(player)  # clear hand
         draw_cards(player, room, 4)
 
     room.game_started = True
-    room.current_player_id = next(iter(room.players.keys()))  # Первый игрок
+    room.current_player_id = next(iter(players.keys()))  # Первый игрок
+    db_update_room(room)
+
     return {"message": "Игра началась", "players": [
-        {"id": p.id, "name": p.name, "role": p.role} for p in room.players.values()
+        {"id": p.id, "name": p.name, "role": p.role} for p in players.values()
     ]}
 
+
 # Helper Functions
+
 def assign_roles(num_players: int) -> List[str]:
     """Assign roles for a game based on the number of players."""
     if num_players == 4:
@@ -205,50 +429,73 @@ def assign_roles(num_players: int) -> List[str]:
     elif num_players == 7:
         roles = ["шериф", "помощник", "помощник", "бандит", "бандит", "ренегат", "ренегат"]
     else:
-        raise ValueError("Unsupported number of players")  # should not happen, handled before
+        raise ValueError("Unsupported number of players")
     random.shuffle(roles)
     return roles
+
 
 def draw_cards(player: Player, room: GameRoom, num: int):
     """Draw a specified number of cards from the deck and add them to the player's hand."""
     for _ in range(num):
-        if room.deck:
-            card = room.deck.pop(0)  # get first from the deck
+        card = draw_card(room)  # Use the draw_card() function from database
+
+        if card:
             player.hand.append(card)
+            db_update_player(player)  # update player
+
         else:
-            # reshuffle
             reshuffle_discard_pile(room)
-            if room.deck:
-                card = room.deck.pop(0)
+
+            card = draw_card(room)
+            if card:
                 player.hand.append(card)
+                db_update_player(player)
             else:
-                return # no cards to add anymore.
+                return
 
-def reshuffle_discard_pile(room : GameRoom):
+
+def clear_player_hand(player: Player):
+    cursor.execute("DELETE FROM player_hands WHERE player_id=?", (player.id,))
+    conn.commit()
+
+
+def reshuffle_discard_pile(room: GameRoom):
     """Reshuffle discard pile into the deck"""
-    if room.discard_pile:
-      random.shuffle(room.discard_pile)
-      room.deck = room.discard_pile
-      room.discard_pile = []
+    discard_pile = db_get_discard_pile(room.id)
+    if discard_pile:
+        random.shuffle(discard_pile)
 
-#Gameplay actions
+        db_clear_deck(room.id)  # Clear existing deck
+        db_clear_discard_pile(room.id)  # Clear discard pile
 
+        for i, card in enumerate(discard_pile):
+            db_add_card_to_deck(room.id, card.name, i)  # Add to the new deck
+
+
+# Gameplay actions
 class PlayerAction(BaseModel):
     player_id: int
     action: str  # "play_card", "pass", "shoot", "use_card"
     card_name: str = None
     target_player_id: Optional[int] = None
+
+
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
+
+
 @app.get("/room/{room_id}")
 def get_room_state(room_id: int):
-    room = rooms.get(room_id)
+    room = db_get_room(room_id)
     if not room:
         return {"error": "Комната не найдена"}
 
     players_info = []
-    for p in room.players.values():
+
+    players = {p_id: db_get_player(p_id) for p_id in room.players}
+
+    for p in players.values():
         players_info.append(
             {
                 "id": p.id,
@@ -263,24 +510,31 @@ def get_room_state(room_id: int):
                 "permanent_effects": p.permanent_effects,
             }
         )
+
+    deck = db_get_deck(room_id)
+
     return {
         "players": players_info,
         "game_started": room.game_started,
         "current_player": room.current_player_id,
-        "deck_count": len(room.deck),
+        "deck_count": len(deck),
     }
+
 
 @app.post("/player_action/{room_id}")
 def player_action(room_id: int, action_data: PlayerAction):
-    room = rooms.get(room_id)
+    room = db_get_room(room_id)
+
     if not room or not room.game_started:
         raise HTTPException(status_code=400, detail="Игра не началась или комната не найдена")
 
     player = get_player_by_id(room, action_data.player_id)
+
     if not player or not player.is_alive:
         raise HTTPException(status_code=404, detail="Игрок не найден или мертв")
 
     current_player = get_current_player(room)
+
     if current_player.id != player.id:
         raise HTTPException(status_code=403, detail="Не ваш ход")
 
@@ -296,42 +550,46 @@ def player_action(room_id: int, action_data: PlayerAction):
             raise HTTPException(status_code=400, detail="Неизвестное действие")
 
     except HTTPException as e:
-        raise e # re-raise
+        raise e  # re-raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# Helper Functions
 def get_player_by_id(room: GameRoom, player_id: int) -> Player:
-    player = room.players.get(player_id)
+    player = db_get_player(player_id)
     if not player:
-         raise HTTPException(status_code=404, detail="Игрок не найден")
+        raise HTTPException(status_code=404, detail="Игрок не найден")
     return player
 
-def get_current_player(room: GameRoom) -> Player:
-    if not room.current_player_id:
-        raise HTTPException(status_code=500, detail="Текущий игрок не определен")
 
-    player = room.players.get(room.current_player_id)
+def get_current_player(room: GameRoom) -> Player:
+    player = db_get_player(room.current_player_id)
     if not player:
         raise HTTPException(status_code=404, detail="Текущий игрок не найден")
     return player
 
+
 def calculate_distance(p1_id: int, p2_id: int, room: GameRoom) -> int:
     """Расчет расстояния между двумя игроками по кругу"""
-    if p1_id == p2_id:
-        return 0
-
     p1 = get_player_by_id(room, p1_id)
     p2 = get_player_by_id(room, p2_id)
+    if not p1 or not p2:
+        raise HTTPException(status_code=404, detail="Игрок не найден")
+
+    if p1_id == p2_id:
+        return 0
 
     num_players = len(room.players)
     distance = abs(p1.position - p2.position)
     distance = min(distance, num_players - distance)
 
-    #Учитываем эффекты мустанга
+    # Учитываем эффекты мустанга
     if has_permanent_effect(p2, "Мустанг"):
         distance += 1
 
     return distance
+
 
 def get_weapon_range(player: Player) -> int:
     weapon_range = WEAPONS.get(player.weapon, 1)  # Default to Colt (range 1)
@@ -339,20 +597,25 @@ def get_weapon_range(player: Player) -> int:
         weapon_range += 1
     return weapon_range
 
+
 def has_permanent_effect(player: Player, effect_name: str) -> bool:
     return effect_name in player.permanent_effects
 
+
 def add_permanent_effect(player: Player, effect_name: str):
-     if effect_name not in player.permanent_effects:
-         player.permanent_effects.append(effect_name)
+    if effect_name not in player.permanent_effects:
+        player.permanent_effects.append(effect_name)
+
 
 def remove_permanent_effect(player: Player, effect_name: str):
     if effect_name in player.permanent_effects:
         player.permanent_effects.remove(effect_name)
 
+
 def handle_shoot(room: GameRoom, shooter: Player, target_player_id: int):
     """Handles the shoot action"""
     target = get_player_by_id(room, target_player_id)
+
     distance = calculate_distance(shooter.id, target.id, room)
     weapon_range = get_weapon_range(shooter)
 
@@ -361,26 +624,31 @@ def handle_shoot(room: GameRoom, shooter: Player, target_player_id: int):
 
     # Find the "Бэнг" card in the shooter's hand
     bang_card = next((card for card in shooter.hand if card.name == "Бэнг"), None)
+
     if not bang_card:
         raise HTTPException(status_code=400, detail="Нет карты 'Бэнг' в руке")
 
     # Remove the "Бэнг" card from the shooter's hand and discard it
     shooter.hand.remove(bang_card)
-    room.discard_pile.append(bang_card)
+    db_remove_card_from_player_hand(shooter.id, bang_card.name)
+
+    db_add_card_to_discard_pile(room.id, bang_card.name)
 
     # The target player must now defend
     return handle_defend(room, target, shooter)  # Pass the shooter as well
-    #Remove maximum hand
+    # Remove maximum hand
     reset_hand_size(shooter)
+
 
 def handle_defend(room: GameRoom, target: Player, shooter: Player):
     """Handles the defending action"""
-    #Check for "Мимо" card
+    # Check for "Мимо" card
     mimo_card = next((card for card in target.hand if card.name == "Мимо"), None)
     if mimo_card:
-        #Remove mimo
+        # Remove mimo
         target.hand.remove(mimo_card)
-        room.discard_pile.append(mimo_card)
+        db_remove_card_from_player_hand(target.id, mimo_card.name)
+        db_add_card_to_discard_pile(room.id, mimo_card.name)
         return {"status": f"Игрок {target.name} уклонился"}
 
     # Check for "Бочка" effect if no "Mimo" card is available
@@ -389,65 +657,74 @@ def handle_defend(room: GameRoom, target: Player, shooter: Player):
         card = draw_card(room)  # Drawing card to check effect
 
         if card and card.suit == "черви":
-            room.discard_pile.append(card)  # Discard the drawn card
+            db_add_card_to_discard_pile(room.id, card.name)  # Discard the drawn card
             return {"status": f"Игрок {target.name} уклонился с помощью бочки!"}
         elif card:
-            room.discard_pile.append(card)  # Discard the drawn card if it's not черви
+            db_add_card_to_discard_pile(room.id, card.name)  # Discard the drawn card if it's not черви
 
     # If no "Mimo" card and no "Бочка" effect, the player takes damage
     target.hp -= 1
+    db_update_player(target)
+
     check_player_death(target, room)
 
     # You can also implement additional logic to handle specific cases
     if target.hp <= 0:
         return {"status": f"Игрок {target.name} убит"}
 
-    return {"status": f"Игрок {target.name} получил выстрел"} #No defending card
+    return {"status": f"Игрок {target.name} получил выстрел"}  # No defending card
 
-def handle_duel(room: GameRoom, p1:Player, p2: Player):
+
+def handle_duel(room: GameRoom, p1: Player, p2: Player):
     """Handles duel action"""
 
     def duel_round(attacker: Player, defender: Player) -> bool:
-      """returns True if the duel can continue, False otherwise"""
-      bang_card = next((card for card in attacker.hand if card.name == "Бэнг"), None)
+        """returns True if the duel can continue, False otherwise"""
+        bang_card = next((card for card in attacker.hand if card.name == "Бэнг"), None)
 
-      if bang_card:
-          attacker.hand.remove(bang_card)
-          room.discard_pile.append(bang_card)
-      else:
-          #Attacker cannot answer -> he lose
-          defender.hp -= 1
-          check_player_death(defender, room)
-          return False # end duel
+        if bang_card:
+            attacker.hand.remove(bang_card)
+            db_remove_card_from_player_hand(attacker.id, bang_card.name)
+            db_add_card_to_discard_pile(room.id, bang_card.name)
+        else:
+            # Attacker cannot answer -> he lose
+            defender.hp -= 1
+            db_update_player(defender)
 
-      return True #Continue duel
+            check_player_death(defender, room)
+            return False  # end duel
 
-    #Duel rounds
+        return True  # Continue duel
+
+    # Duel rounds
     current_attacker = p2
-    current_defender = p1 #Player
+    current_defender = p1  # Player
 
     while True:
-      if not duel_round(current_attacker, current_defender):
-        break
+        if not duel_round(current_attacker, current_defender):
+            break
 
-      #Swap players
-      current_attacker, current_defender = current_defender, current_attacker
+        # Swap players
+        current_attacker, current_defender = current_defender, current_attacker
 
-      #After a shoot
-      if not duel_round(current_attacker, current_defender):
-        break
+        # After a shoot
+        if not duel_round(current_attacker, current_defender):
+            break
 
-    #After duel
-    return {"status" : "Duel has been completed"}
+    # After duel
+    return {"status": "Duel has been completed"}
 
-def handle_play_card(room: GameRoom, player: Player, card_name: str, target_player_id : Optional[int] = None):
+
+def handle_play_card(room: GameRoom, player: Player, card_name: str, target_player_id: Optional[int] = None):
     """Handles the playing of a card"""
+
     card = next((card for card in player.hand if card.name == card_name), None)
     if not card:
         raise HTTPException(status_code=400, detail="Карта не найдена в руке")
 
     player.hand.remove(card)
-    room.discard_pile.append(card)
+    db_remove_card_from_player_hand(player.id, card.name)
+    db_add_card_to_discard_pile(room.id, card.name)
 
     if card.name == "Пиво":
         handle_pivo(player, room)
@@ -462,7 +739,7 @@ def handle_play_card(room: GameRoom, player: Player, card_name: str, target_play
     elif card.name == "Уэллс Фарго":
         draw_cards(player, room, 3)
         reset_hand_size(player)
-        return {"status" : "Уэллс Фарго использован"}
+        return {"status": "Уэллс Фарго использован"}
 
     elif card.name == "Магазин":
         handle_magazin(player, room)
@@ -476,184 +753,51 @@ def handle_play_card(room: GameRoom, player: Player, card_name: str, target_play
 
     elif card.name == "Дуэль":
         if target_player_id == None:
-          raise HTTPException(status_code=400, detail="Не указан целевой игрок")
+            raise HTTPException(status_code=400, detail="Не указан целевой игрок")
         target = get_player_by_id(room, target_player_id)
         return handle_duel(room, player, target)
 
     elif card.name == "Тюрьма":
         if target_player_id == None:
-           raise HTTPException(status_code=400, detail="Не указан целевой игрок")
+            raise HTTPException(status_code=400, detail="Не указан целевой игрок")
 
         handle_turma(player, get_player_by_id(room, target_player_id))
         reset_hand_size(player)
-        return {"status" : "Тюрьма применена на целевого игрока"}
+        return {"status": "Тюрьма применена на целевого игрока"}
 
     elif card.name == "Динамит":
-         handle_dynamite(room)
-         reset_hand_size(player)
-         return {"status" : "Динамит применен"}
+        handle_dynamite(room)
+        reset_hand_size(player)
+        return {"status": "Динамит применен"}
 
     elif card.name == "Бочка":
-         handle_bocka(player)
-         reset_hand_size(player)
-         return {"status" : "Бочка применена"}
+        handle_bocka(player)
+        reset_hand_size(player)
+        return {"status": "Бочка применена"}
 
     elif card.name == "Мустанг":
-         handle_pivo(player, room)
-         reset_hand_size(player)
-         add_permanent_effect(player, card.name)
-         return {"status" : "Мустанг был применен"}
+        handle_pivo(player, room)
+        reset_hand_size(player)
+        add_permanent_effect(player, card.name)
+        return {"status": "Мустанг был применен"}
     elif card.name == "Прицел":
-         handle_pivo(player, room)
-         reset_hand_size(player)
-         add_permanent_effect(player, card.name)
-         return {"status" : "Прицел был применен"}
+        handle_pivo(player, room)
+        reset_hand_size(player)
+        add_permanent_effect(player, card.name)
+        return {"status": "Прицел был применен"}
     elif card.name == "Скофилд":
-         handle_pivo(player, room)
-         reset_hand_size(player)
-         add_permanent_effect(player, card.name)
-         return {"status" : "Скофилд был применен"}
+        handle_pivo(player, room)
+        reset_hand_size(player)
+        add_permanent_effect(player, card.name)
+        return {"status": "Скофилд был применен"}
     elif card.name == "Паника":
-          handle_panic(player, room)
-          reset_hand_size(player)
-          return {"status" : "Паника применена"}
+        handle_panic(player, room)
+        reset_hand_size(player)
+        return {"status": "Паника применена"}
     elif card.name == "Красотка":
-         handle_krassotka(player, room)
-         reset_hand_size(player)
-         return {"status" : "Красотка применена"}
-
+        handle_krassotka(player, room)
+        reset_hand_size(player)
+        return {"status": "Красотка применена"}
 
     reset_hand_size(player)
-    return {"status": f"Карта '{card_name}' сыграна"}
-
-def handle_gatling(room: GameRoom, p1: Player):
-    """Handles the Gatling card"""
-    #Fire at everyone who can be defended
-    for p2Id, p2 in room.players.items():
-        #Avoid shooting yourself
-        if p2Id != p1.id:
-            handle_defend(room, p2, p1)
-
-def handle_magazin(player: Player, room: GameRoom):
-     for _ in range(len(room.players.values())): #number of players
-            if room.deck:
-                card = room.deck.pop(0)
-                player.hand.append(card) #add to current player hand
-            else:
-                reshuffle_discard_pile(room)
-                if room.deck:
-                    card = room.deck.pop(0)
-                    player.hand.append(card) #add to current player hand
-                else:
-                    break
-
-def handle_dynamite(room: GameRoom):
-    process_dynamite_trigger(room)
-
-def handle_bocka(player: Player):
-  add_permanent_effect(player, "Бочка")
-
-def check_turma(player: Player, room: GameRoom) -> bool:
-    card = draw_card(room)
-    if card and card.suit == "черви":
-        remove_permanent_effect(player, "Тюрьма")
-        room.discard_pile.append(card)
-        return True  # Освобожден
-    else:
-        if card:
-            room.discard_pile.append(card)
-        return False
-
-def handle_krassotka(player: Player, room: GameRoom):
-  """Handles Panika effect action, take a random card"""
-  if not room.current_player_id:
-        raise HTTPException(status_code=500, detail="Текущий игрок не определен")
-
-  for p2Id, p2 in room.players.items():
-        if p2Id != room.current_player_id and p2.hand:
-           #Remove a random card from target
-           card_to_steal_index = random.randint(0, len(p2.hand) - 1)
-           card_to_steal = p2.hand.pop(card_to_steal_index)
-           #Add card
-           player.hand.append(card_to_steal)
-           room.discard_pile.append(card_to_steal) #remove from discard pile
-
-def handle_panic(player: Player, room: GameRoom):
-  """Handles Panika effect action, take a random card"""
-  if not room.current_player_id:
-        raise HTTPException(status_code=500, detail="Текущий игрок не определен")
-
-  for p2Id, p2 in room.players.items():
-        if p2Id != room.current_player_id and p2.hand:
-           #Remove a random card from target
-           card_to_steal_index = random.randint(0, len(p2.hand) - 1)
-           card_to_steal = p2.hand.pop(card_to_steal_index)
-           #Add card
-           player.hand.append(card_to_steal)
-
-def handle_pivo(player: Player, room: GameRoom):
-    if player.hp < player.max_hp:
-        player.hp += 1
-
-def check_player_death(player: Player, room: GameRoom):
-    if player.hp <= 0:
-        player.is_alive = False
-
-def pass_turn(room: GameRoom):
-    """Advances the game turn to the next player."""
-    advance_turn(room)
-
-def advance_turn(room: GameRoom):
-    players = list(room.players.values())
-    current_idx = next((i for i, p in enumerate(players) if p.id == room.current_player_id), 0)
-    total = len(players)
-    for i in range(1, total + 1):
-        next_idx = (current_idx + i) % total
-        next_player = players[next_idx]
-        if next_player.is_alive:
-            room.current_player_id = next_player.id
-            break
-
-def draw_card(room : GameRoom)-> Card:
-    if  room.deck:
-       return room.deck.pop(0)
-    else:
-        reshuffle_discard_pile(room)
-        if  room.deck:
-            return room.deck.pop(0)
-        else:
-            return None #no card at all!
-
-def process_dynamite_trigger(room: GameRoom):
-    for p in list(room.players.values()):
-        if has_permanent_effect(p, 'Динамит'):
-            card = draw_card(room)
-            if not card:
-                continue
-            if card.suit == 'пики' and 2 <= card.value and card.value <= 9:
-                # Взрыв! Игрок теряет 3 хп и динамит снимается.
-                p.hp -= 3
-                remove_permanent_effect(p, 'Динамит')
-                room.discard_pile.append(card)
-                check_player_death(p, room)
-            else:
-                add_permanent_effect(p, 'Динамит')
-                room.discard_pile.append(card)
-
-def get_next_player(room: GameRoom, current_player_id: int) -> Optional[Player]:
-  """Get next player in a circle"""
-  players = list(room.players.values())
-  current_idx = next((i for i, p in enumerate(players) if p.id == current_player_id), 0)
-  total = len(players)
-  for i in range(1, total + 1):
-    next_idx = (current_idx + i) % total
-    next_player = players[next_idx]
-    if next_player.is_alive:
-      return next_player
-
-  return None #no next player
-
-def reset_hand_size(player : Player):
-   while len(player.hand) > player.hp:
-        card = player.hand.pop() #reset the size
-        #Discard ?
+    return {"status": f"Карта '{card_name}' сыгра
